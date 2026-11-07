@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Iterable
 
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -16,11 +17,27 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
                            InlineKeyboardButton, ReplyKeyboardMarkup,
                            KeyboardButton)
 from dotenv import load_dotenv
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 DB_PATH = os.getenv("DATABASE_PATH", "marketplace.sqlite3").strip() or "marketplace.sqlite3"
+
+# Render Web Service webhook settings.
+RUN_MODE = os.getenv("RUN_MODE", "webhook").strip().lower()
+BASE_WEBHOOK_URL = (
+    os.getenv("WEBHOOK_URL", os.getenv("RENDER_EXTERNAL_URL", "")).strip().rstrip("/")
+)
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
+if not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = "/" + WEBHOOK_PATH
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+if not WEBHOOK_SECRET:
+    import secrets
+    WEBHOOK_SECRET = secrets.token_urlsafe(32)
+WEB_SERVER_HOST = "0.0.0.0"
+WEB_SERVER_PORT = int(os.getenv("PORT", "10000"))
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN .env faylida ko'rsatilmagan")
@@ -322,10 +339,10 @@ async def moderate(call: CallbackQuery, bot: Bot):
 async def myid(message: Message):
     await message.answer(f"Sizning Telegram ID: <code>{message.from_user.id}</code>")
 
-async def main():
-    await init_db()
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+def build_dispatcher() -> Dispatcher:
+    """Create the dispatcher and register all bot handlers."""
     dp = Dispatcher(storage=MemoryStorage())
+
     dp.message.register(start, CommandStart())
     dp.message.register(myid, Command("myid"))
     dp.message.register(admin_panel, Command("admin"))
@@ -343,16 +360,78 @@ async def main():
     dp.message.register(rank_step, ListingForm.rank)
     dp.message.register(description_step, ListingForm.description)
     dp.message.register(report_reason, ListingForm.report_reason)
+
     dp.callback_query.register(view_listing, F.data.startswith("view:"))
     dp.callback_query.register(favorite, F.data.startswith("fav:"))
     dp.callback_query.register(create_inquiry, F.data.startswith("buy:"))
     dp.callback_query.register(report_start, F.data.startswith("report:"))
-    dp.callback_query.register(moderate, F.data.startswith("approve:") | F.data.startswith("reject:"))
-    log.info("Bot ishga tushmoqda. Adminlar: %s", len(ADMIN_IDS))
+    dp.callback_query.register(
+        moderate,
+        F.data.startswith("approve:") | F.data.startswith("reject:")
+    )
+    return dp
+
+
+async def health_check(_: web.Request) -> web.Response:
+    """Simple endpoint for Render health checks."""
+    return web.json_response({"status": "ok"})
+
+
+async def run_polling(bot: Bot, dp: Dispatcher) -> None:
+    """Optional local development mode. Do not use this on Render Web Service."""
+    await init_db()
+    log.info("Bot polling rejimida ishga tushmoqda. Adminlar: %s", len(ADMIN_IDS))
     await dp.start_polling(bot)
+
+
+def main() -> None:
+    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = build_dispatcher()
+
+    if RUN_MODE == "polling":
+        asyncio.run(run_polling(bot, dp))
+        return
+
+    if RUN_MODE != "webhook":
+        raise RuntimeError("RUN_MODE 'webhook' yoki 'polling' bo'lishi kerak.")
+
+    if not BASE_WEBHOOK_URL:
+        raise RuntimeError(
+            "Webhook URL topilmadi. Render Web Service'da RENDER_EXTERNAL_URL mavjud "
+            "bo'lishi kerak yoki WEBHOOK_URL environment variable kiriting."
+        )
+
+    async def on_startup(bot: Bot) -> None:
+        await init_db()
+        webhook_url = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
+        await bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+        log.info("Webhook o'rnatildi: %s", webhook_url)
+        log.info("Bot ishga tushdi. Adminlar: %s", len(ADMIN_IDS))
+
+    dp.startup.register(on_startup)
+
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    )
+    webhook_handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
+    log.info("HTTP server %s:%s manzilda ishga tushmoqda.", WEB_SERVER_HOST, WEB_SERVER_PORT)
+    web.run_app(app, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
+
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         log.info("Bot to'xtatildi")
